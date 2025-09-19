@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+
+# FPL Cache directory
+fpl_cache/
+
+# Configuration file with secrets
+config.json
+
+# macOS specific files
+.DS_Store
