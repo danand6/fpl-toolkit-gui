@@ -12,5 +12,10 @@ fpl_cache/
 # Configuration file with secrets
 config.json
 
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
 # macOS specific files
 .DS_Store

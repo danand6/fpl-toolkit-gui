@@ -19,6 +19,7 @@ FPL_API_URL_LIVE = "https://fantasy.premierleague.com/api/event/{gameweek}/live/
 FPL_API_URL_LEAGUE = "https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/"
 FPL_API_URL_GENERAL_ENTRY = "https://fantasy.premierleague.com/api/entry/{team_id}/"
 FPL_API_URL_FIXTURES = "https://fantasy.premierleague.com/api/fixtures/"
+FPL_API_URL_ELEMENT_SUMMARY = "https://fantasy.premierleague.com/api/element-summary/{player_id}/"
 
 # --- INTERNAL CACHING HELPER ---
 
@@ -86,6 +87,12 @@ def get_entry_data(team_id: int) -> dict:
 def get_fixtures_data() -> list:
     """Fetches data for all fixtures in the season, using a cache."""
     return _get_cached_data("fixtures.json", FPL_API_URL_FIXTURES)
+
+def get_element_summary(player_id: int) -> dict:
+    """Fetches detailed history for a specific player, using cache."""
+    cache_filename = f"element_{player_id}.json"
+    url = FPL_API_URL_ELEMENT_SUMMARY.format(player_id=player_id)
+    return _get_cached_data(cache_filename, url)
 
 # --- UTILITY FUNCTIONS ---
 
@@ -489,6 +496,223 @@ def get_dream_team_optimizer_string(bootstrap_data: dict, fixtures_data: list, c
         pred_pts = predictions.get(player['id'], 0)
         output.append(f"{player['web_name']:<20} {pos:<5} {price:<7} (Pred: {pred_pts:.2f})")
     return "\n".join(output)
+
+
+def get_chip_advice_string(team_id: int, current_gameweek: int, bootstrap_data: dict, fixtures_data: list,
+                           team_map: dict, position_map: dict) -> str:
+    """Generate heuristic advice for FPL chips based on upcoming predictions and squad depth."""
+    predictions = get_predictions(bootstrap_data, fixtures_data, current_gameweek)
+    picks = get_team_picks(team_id, current_gameweek)
+    entry_data = get_entry_data(team_id)
+    player_lookup_map = {player['id']: player for player in bootstrap_data['elements']}
+
+    starters, bench = [], []
+    flagged_count = 0
+
+    for pick in picks['picks']:
+        player_id = pick['element']
+        multiplier = pick.get('multiplier', 1)
+        player_data = player_lookup_map.get(player_id)
+        if not player_data:
+            continue
+        predicted = predictions.get(player_id, 0.0)
+        chip_info = {
+            'player': player_data,
+            'predicted': predicted,
+            'multiplier': multiplier,
+            'is_captain': bool(pick.get('is_captain')),
+            'is_vice': bool(pick.get('is_vice_captain')),
+        }
+        if multiplier > 0:
+            starters.append(chip_info)
+        else:
+            bench.append(chip_info)
+        if player_data.get('status') != 'a':
+            flagged_count += 1
+
+    output = [f"--- Chip Strategy Advisor (GW {current_gameweek}) ---"]
+
+    if not starters:
+        return "Unable to evaluate chips because your squad could not be retrieved."
+
+    output.append("")
+
+    # Triple Captain: look for highest predicted starter and check upcoming fixtures
+    best_starter = max(starters, key=lambda s: s['predicted'])
+    best_name = best_starter['player']['web_name']
+    best_team = team_map.get(best_starter['player']['team'], 'N/A')
+    best_points = best_starter['predicted']
+    if best_points >= 7.5:
+        tc_blurb = (
+            f"TRIPLE CAPTAIN: {best_name} ({best_team}) projects {best_points:.2f} points. "
+            "Looks like a strong week if you want an aggressive play."
+        )
+    elif best_points >= 6.0:
+        tc_blurb = (
+            f"TRIPLE CAPTAIN: {best_name} ({best_team}) sits around {best_points:.2f} predicted points. "
+            "Solid, but you might wait for a double gameweek."
+        )
+    else:
+        tc_blurb = (
+            f"TRIPLE CAPTAIN: No standout option this week (top projection {best_points:.2f}). "
+            "Probably better to hold."
+        )
+    output.append(tc_blurb)
+
+    # Bench Boost: aggregate bench predicted points
+    bench_total = sum(player['predicted'] for player in bench)
+    if bench_total >= 16:
+        bb_blurb = (
+            f"BENCH BOOST: Bench projects {bench_total:.2f} points. This is a very healthy bench boost week." )
+    elif bench_total >= 12:
+        bb_blurb = (
+            f"BENCH BOOST: Bench projects {bench_total:.2f} points. Decent potential if you need a chip soon." )
+    else:
+        bb_blurb = (
+            f"BENCH BOOST: Bench projects only {bench_total:.2f} points. Better to hold unless you expect late doubles." )
+    output.append(bb_blurb)
+
+    # Wildcard / Free Hit suggestions based on flagged players and fixture difficulty
+    total_players = len(starters) + len(bench)
+    flagged_ratio = flagged_count / total_players if total_players else 0
+
+    if flagged_ratio >= 0.3:
+        wc_blurb = (
+            "WILDCARD: Over 30% of your squad is flagged. Strong case to reset with a wildcard." )
+    elif flagged_ratio >= 0.2:
+        wc_blurb = (
+            "WILDCARD: A few injuries piling up. Consider a wildcard if future fixtures are poor." )
+    else:
+        wc_blurb = (
+            "WILDCARD: Squad health is solid right now. Save the wildcard unless you plan for doubles." )
+    output.append(wc_blurb)
+
+    upcoming_blanks = _count_blank_players(starters + bench, fixtures_data, current_gameweek)
+    if upcoming_blanks >= 6:
+        fh_blurb = (
+            f"FREE HIT: You have {upcoming_blanks} players projected to blank soon. Free Hit could stabilise that GW." )
+    elif upcoming_blanks >= 4:
+        fh_blurb = (
+            f"FREE HIT: {upcoming_blanks} players may blank soon; keep it in mind if transfers won't cover it." )
+    else:
+        fh_blurb = "FREE HIT: No major blank warning. Keep the chip unless fixtures flip quickly."
+    output.append(fh_blurb)
+
+    output.append("")
+    output.append("Bank: £{:.1f}m, Free transfers: {}".format(
+        entry_data.get('last_deadline_bank', 0) / 10.0,
+        entry_data.get('last_deadline_total_transfers', 0)
+    ))
+    return "\n".join(output)
+
+
+def _count_blank_players(players: list, fixtures_data: list, current_gameweek: int) -> int:
+    upcoming = [f for f in fixtures_data if f.get('event') and f['event'] >= current_gameweek]
+    players_with_fixtures = set()
+    for fixture in upcoming:
+        players_with_fixtures.add(fixture['team_a'])
+        players_with_fixtures.add(fixture['team_h'])
+
+    blanks = 0
+    for info in players:
+        team_id = info['player'].get('team')
+        if team_id not in players_with_fixtures:
+            blanks += 1
+    return blanks
+
+def generate_ai_prediction_table(bootstrap_data: dict, history_window: int = 5, max_players: int = 200) -> dict:
+    """Uses an AI model to predict next-match points for active players."""
+    try:
+        import ai_models
+    except ImportError as exc:
+        raise RuntimeError("AI models module not available") from exc
+
+    active_players = [
+        player for player in bootstrap_data['elements']
+        if player.get('status', 'a') == 'a' and player.get('minutes', 0) > 0
+    ]
+
+    if not active_players:
+        return {"type": "string", "data": "No active player data available."}
+
+    # Prioritise players with good form or total points to limit API calls
+    def player_priority(player: dict) -> float:
+        try:
+            return float(player.get('form', 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    shortlisted = sorted(active_players, key=player_priority, reverse=True)[:max_players]
+
+    player_histories = []
+    for player in shortlisted:
+        try:
+            summary = get_element_summary(player['id'])
+        except requests.exceptions.RequestException:
+            continue
+        history = summary.get('history', [])
+        if len(history) < history_window + 1:
+            continue
+        player_histories.append({
+            'player': player,
+            'history': history,
+        })
+
+    if len(player_histories) < 15:
+        return {"type": "string", "data": "Insufficient player history to train AI model."}
+
+    model = ai_models.train_points_model(player_histories, history_window=history_window)
+    predictions = ai_models.predict_upcoming_points(model, player_histories, history_window)
+
+    team_map = create_team_map(bootstrap_data)
+    position_map = create_position_map(bootstrap_data)
+
+    table_rows = []
+    series = []
+
+    for item in predictions[:30]:
+        player = item['player']
+        player_id = player['id']
+        name = player.get('web_name', 'Unknown')
+        team = team_map.get(player.get('team'), 'N/A')
+        position = position_map.get(player.get('element_type'), 'UNK')
+        ai_score = item['predicted']
+        avg_points = item.get('avg_points', 0.0)
+        form = player.get('form', '0')
+
+        table_rows.append([
+            name,
+            team,
+            position,
+            f"{ai_score:.2f}",
+            f"{avg_points:.2f}",
+            str(form),
+        ])
+        series.append({
+            'label': f"{name} ({team})",
+            'value': ai_score,
+        })
+
+    return {
+        "type": "table",
+        "title": "AI Predicted Top Performers",
+        "headers": [
+            "Player",
+            "Team",
+            "Position",
+            "Predicted Points (AI)",
+            "Avg Points (Last 5)",
+            "Form"
+        ],
+        "rows": table_rows,
+        "chartSeries": series,
+        "chartLabel": "Predicted Points (AI)",
+        "metadata": {
+            "model": model.get('name', 'Linear Regressor'),
+            "history_window": history_window,
+            "trained_samples": model.get('samples', 0)
+        }
+    }
 
 def get_league_predictions_string(league_id: int, current_gameweek: int, bootstrap_data: dict, fixtures_data: list) -> str:
     """Generates a string of predicted scores for every manager in the league."""
